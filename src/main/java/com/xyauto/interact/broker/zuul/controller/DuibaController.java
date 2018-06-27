@@ -1,0 +1,196 @@
+package com.xyauto.interact.broker.zuul.controller;
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
+import com.mcp.validate.annotation.Check;
+import com.xyauto.interact.broker.zuul.enums.ResultCode;
+import com.xyauto.interact.broker.zuul.util.Result;
+import com.xyauto.interact.broker.zuul.util.StringUtil;
+import com.xyauto.interact.broker.zuul.util.duiba.CreditConsumeParams;
+import com.xyauto.interact.broker.zuul.util.duiba.CreditConsumeResult;
+import com.xyauto.interact.broker.zuul.util.duiba.CreditNotifyParams;
+import com.xyauto.interact.broker.zuul.util.duiba.CreditTool;
+import com.xyauto.interact.broker.zuul.util.duiba.service.DuibaService;
+import org.apache.commons.lang.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.servlet.http.HttpServletRequest;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Created by zhangwd on 2017/12/11.
+ */
+
+@RequestMapping("duiba")
+@RestController
+public class DuibaController extends BaseController {
+
+    @Value("${duiba.appkey}")
+    private String duiba_appkey;
+
+    @Value("${duiba.appsecret}")
+    private String duiba_appsecret;
+
+    @Autowired
+    private DuibaService duibaService;
+
+
+    @RequestMapping(value = "login")
+    public void auto_login(
+            @Check(name = "经纪人id", required = false) String uid,
+            @Check(name = "跳转地址", required = false) String dbredirect) throws IOException {
+        String credits = "0";
+        if (StringUtils.isEmpty(uid) || "not_login".equals(uid)) {
+            httpServletResponse.sendRedirect(this.getAutoLoginUrl("not_login", credits, dbredirect));
+        } else {
+            credits = this.getBalance(Long.valueOf(uid));
+            httpServletResponse.sendRedirect(this.getAutoLoginUrl(uid, credits, dbredirect));
+        }
+    }
+
+
+    /**
+     * 自动登录  免登录接口
+     *
+     * @return
+     */
+    @RequestMapping(value = "auto_login")
+    public Object auto_login(
+            @Check(name = "经纪人id", required = false) Long broker_id,
+            @Check(name = "跳转地址", required = false) String dbredirect
+    ) {
+        //是否兑吧请求 根据uid是否为空判断
+        String uid = "not_login";
+        String credits = "0";
+        if (broker_id != null) {
+            uid = broker_id.toString();
+            credits = this.getBalance(broker_id);
+        }
+        Map<String, Object> map = new HashMap<String, Object>();
+        map.put("autologinUrl", getAutoLoginUrl(uid, credits, dbredirect));
+        result.format(ResultCode.Success, map);
+        return result;
+    }
+
+    public String getBalance(Long broker_id) {
+        if (broker_id != null) {
+            result = brokerServerCloud.integralQueryBalance(new HashMap() {{
+                put("broker_id", broker_id);
+            }});
+            if (result.getCode() != 10000) {
+                return "0";
+            }
+            JSONObject obj = JSON.parseObject(result.getData().toString());
+            return obj.getString("balance");
+        }
+        return "0";
+    }
+
+    public String getAutoLoginUrl(String uid, String credits, String dbredirect) {
+        CreditTool tool = new CreditTool(duiba_appkey, duiba_appsecret);
+        String url = "https://www.duiba.com.cn/autoLogin/autologin?";
+        Map<String, String> params = new HashMap<String, String>();
+        params.put("uid", uid);
+        params.put("credits", credits);
+        if (StringUtils.isEmpty(dbredirect)) {
+            dbredirect = "http://www.duiba.com.cn/chome/index";
+        }
+        params.put("redirect", dbredirect);
+        String autoLoginUrl = tool.buildUrlWithSign(url, params);
+        return autoLoginUrl;
+    }
+
+    /**
+     * 扣除积分
+     * 1:添加请求日志
+     * 2:实际减积分，调用积分策略等
+     *
+     * @return
+     */
+    @RequestMapping(value = "deduction_points")
+    public String deduction_points(HttpServletRequest request) {
+        CreditTool tool = new CreditTool(duiba_appkey, duiba_appsecret);
+        CreditConsumeResult creditConsumeResult = new CreditConsumeResult();
+        try {
+            CreditConsumeParams params = tool.parseCreditConsume(request);//利用tool来解析这个请求
+            //记录兑吧请求的数据
+            duibaService.addCreditConsumeParams(params);
+            String localBizId = params.getId();
+            //记录
+            creditConsumeResult.setBizId(localBizId);
+            creditConsumeResult.setSubCredits(params.getCredits());
+            creditConsumeResult.setOrderNum(params.getOrderNum());
+            //扣除积分
+            result = brokerServerCloud.integralAddPoint(new HashMap() {{
+                put("broker_id", params.getUid());
+                put("integral", -params.getCredits());
+                put("desc", "积分兑换商品扣减积分");
+            }});
+            if (result.getCode() != 10000) {
+                creditConsumeResult.setSuccess(false);
+                creditConsumeResult.setLocalMessage("账户积分扣除");
+            } else {
+                creditConsumeResult.setSuccess(true);
+            }
+            //封装用户余额
+                result = brokerServerCloud.integralQueryBalance(new HashMap() {{
+                    put("broker_id", params.getUid());
+                }});
+                JSONObject obj = JSON.parseObject(result.getData().toString());
+                String credits = obj.getString("balance");
+                creditConsumeResult.setCredits(Long.valueOf(credits));
+        } catch (Exception e) {
+            e.printStackTrace();
+            creditConsumeResult.setSuccess(false);
+            creditConsumeResult.setLocalMessage(e.getMessage());
+        }
+        //记录返回给兑吧的数据
+        duibaService.addCreditConsumeResult(creditConsumeResult);
+        LOGGER.info("creditConsumeResult.toString()：" + creditConsumeResult.toString());
+        return creditConsumeResult.toString();
+    }
+
+    /**
+     * 接收兑吧通知接口
+     *
+     * @return
+     */
+    @RequestMapping(value = "receive_notify")
+    public String receive_notify(HttpServletRequest request) {
+        CreditTool tool = new CreditTool(duiba_appkey, duiba_appsecret);
+        try {
+            CreditNotifyParams params = tool.parseCreditNotify(request);//利用tool来解析这个请求
+            duibaService.addCreditNotifyParams(params);
+            if (params.isSuccess()) {
+                //兑换成功
+            } else {
+                //兑换失败，根据orderNum，对用户的金币进行返还，回滚操作
+                LOGGER.error(params.toString());
+                String orderNum = params.getOrderNum();
+                if (!StringUtils.isEmpty(orderNum)) {
+                    CreditConsumeResult creditConsumeResult = duibaService.getCreditConsumeResultByOrderNum(orderNum);
+                    if (creditConsumeResult.isSuccess()) {
+                        //扣除积分
+                        LOGGER.error("积分兑换商品失败返还积分");
+                        result = brokerServerCloud.integralAddPoint(new HashMap() {{
+                            put("broker_id", params.getUid());
+                            //原值是负的，这里增加
+                            put("integral", creditConsumeResult.getSubCredits());
+                            put("desc", "积分兑换商品失败返还积分");
+                        }});
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.info("接收兑吧通知接口处理失败");
+            e.printStackTrace();
+        }
+        return "ok";
+    }
+}
